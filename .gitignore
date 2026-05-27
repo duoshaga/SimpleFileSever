@@ -3,3 +3,5 @@ build_*/
 *.spec
 __pycache__/
 *.py[cod]
+settings.ini
+dist/settings.ini
