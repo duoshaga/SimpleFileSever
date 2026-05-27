@@ -1,6 +1,7 @@
 ﻿import html
 import ctypes
 import io
+import json
 import os
 import socket
 import sys
@@ -24,7 +25,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -67,20 +68,49 @@ class SingleInstance:
             self.handle = None
 
 
-def load_last_folder():
+def normalize_folders(folders):
+    result = []
+    seen = set()
+
+    for folder in folders:
+        folder_path = Path(folder).resolve()
+        key = os.path.normcase(str(folder_path))
+        if key in seen or not folder_path.is_dir():
+            continue
+        seen.add(key)
+        result.append(folder_path)
+
+    return result
+
+
+def load_shared_folders():
     try:
-        folder = SETTINGS_FILE.read_text(encoding="utf-8").strip()
+        content = SETTINGS_FILE.read_text(encoding="utf-8").strip()
     except OSError:
-        return Path.home()
+        return [Path.home()]
 
-    if folder and os.path.isdir(folder):
-        return Path(folder)
-    return Path.home()
+    if not content:
+        return [Path.home()]
 
-
-def save_last_folder(folder):
     try:
-        SETTINGS_FILE.write_text(str(Path(folder).resolve()), encoding="utf-8")
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return normalize_folders([content]) or [Path.home()]
+
+    if isinstance(data, dict):
+        folders = data.get("shared_folders", [])
+    elif isinstance(data, list):
+        folders = data
+    else:
+        folders = []
+
+    return normalize_folders(folders) or [Path.home()]
+
+
+def save_shared_folders(folders):
+    data = {"shared_folders": [str(folder) for folder in normalize_folders(folders)]}
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -131,7 +161,8 @@ class DownloadRateLimiter:
 
 
 class FileRequestHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, rate_limiter=None, **kwargs):
+    def __init__(self, *args, shared_folders=None, rate_limiter=None, **kwargs):
+        self.shared_folders = [Path(folder).resolve() for folder in (shared_folders or [])]
         self.rate_limiter = rate_limiter or DownloadRateLimiter()
         super().__init__(*args, **kwargs)
 
@@ -141,13 +172,71 @@ class FileRequestHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        target = Path(self.translate_path(parsed.path)).resolve()
+        if parsed.path.rstrip("/") == "":
+            self.send_shared_root()
+            return
+
+        target, base_folder = self.shared_target(parsed.path)
+        if target is None:
+            self.send_error(404, "Shared folder not found")
+            return
 
         if query.get("download") == ["1"] and target.is_dir():
-            self.send_directory_zip(target)
+            self.send_directory_zip(target, base_folder)
             return
 
         super().do_GET()
+
+    def shared_target(self, url_path):
+        parsed = urllib.parse.urlsplit(url_path)
+        parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+        if not parts:
+            return None, None
+
+        try:
+            index = int(parts[0])
+        except ValueError:
+            return None, None
+
+        if index < 0 or index >= len(self.shared_folders):
+            return None, None
+
+        base_folder = self.shared_folders[index]
+        relative_path = Path(*parts[1:]) if len(parts) > 1 else Path()
+        target = (base_folder / relative_path).resolve()
+
+        try:
+            target.relative_to(base_folder)
+        except ValueError:
+            return None, None
+
+        return target, base_folder
+
+    def translate_path(self, path):
+        target, _base_folder = self.shared_target(path)
+        if target is None:
+            return str(Path(self.directory).resolve())
+        return str(target)
+
+    def send_shared_root(self):
+        rows = []
+        for index, folder in enumerate(self.shared_folders):
+            escaped_name = html.escape(folder.name or str(folder), quote=False)
+            escaped_path = html.escape(str(folder), quote=False)
+            folder_href = f"{index}/"
+            download_href = f"{index}/?download=1"
+            rows.append(
+                "<li>"
+                f'<a class="name" href="{folder_href}">{escaped_name}/<span>{escaped_path}</span></a>'
+                f'<a class="download" href="{download_href}">下载文件夹</a>'
+                "</li>"
+            )
+
+        if not rows:
+            rows.append("<li>没有可用的共享文件夹</li>")
+
+        response = self.send_html_page("共享文件夹", "".join(rows))
+        self.copyfile(response, self.wfile)
 
     def list_directory(self, path):
         try:
@@ -182,12 +271,16 @@ class FileRequestHandler(SimpleHTTPRequestHandler):
             else:
                 rows.append(f'<li><a class="name" href="{quoted_name}">{escaped_name}</a></li>')
 
+        return self.send_html_page(f"文件列表 {display_path}", "".join(rows))
+
+    def send_html_page(self, title, rows_html):
+        escaped_title = html.escape(title, quote=False)
         html_text = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>文件列表 {display_path}</title>
+<title>{escaped_title}</title>
 <style>
 body {{
     margin: 0;
@@ -234,6 +327,12 @@ a:hover {{
     flex: 1;
     overflow-wrap: anywhere;
 }}
+.name span {{
+    display: block;
+    margin-top: 4px;
+    color: #6b7280;
+    font-size: 12px;
+}}
 .download {{
     flex: none;
     color: #166534;
@@ -243,9 +342,9 @@ a:hover {{
 </head>
 <body>
 <main>
-<h1>文件列表 {display_path}</h1>
+<h1>{escaped_title}</h1>
 <ul>
-{''.join(rows)}
+{rows_html}
 </ul>
 </main>
 </body>
@@ -277,8 +376,8 @@ a:hover {{
             self.rate_limiter.wait_for(len(chunk))
             self.wfile.write(chunk)
 
-    def send_directory_zip(self, folder):
-        base_folder = Path(self.directory).resolve()
+    def send_directory_zip(self, folder, base_folder):
+        base_folder = Path(base_folder).resolve()
         folder = folder.resolve()
 
         try:
@@ -320,7 +419,7 @@ class FileServer:
     def __init__(self):
         self.httpd = None
         self.thread = None
-        self.folder = None
+        self.folders = []
         self.port = None
         self.rate_limiter = DownloadRateLimiter()
 
@@ -328,15 +427,20 @@ class FileServer:
     def running(self):
         return self.httpd is not None
 
-    def start(self, folder, port, speed_limit_kb):
+    def start(self, folders, port, speed_limit_kb):
         if self.running:
             return
 
-        folder_path = Path(folder).resolve()
+        folder_paths = [Path(folder).resolve() for folder in folders]
         self.rate_limiter.set_limit(speed_limit_kb)
-        handler = partial(FileRequestHandler, directory=str(folder_path), rate_limiter=self.rate_limiter)
+        handler = partial(
+            FileRequestHandler,
+            directory=str(app_directory()),
+            shared_folders=folder_paths,
+            rate_limiter=self.rate_limiter,
+        )
         self.httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
-        self.folder = folder_path
+        self.folders = folder_paths
         self.port = port
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -401,7 +505,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("文件服务器")
         title.setObjectName("title")
-        subtitle = QLabel("选择一个文件夹，启动后同一网络内的设备可以通过下方地址访问。")
+        subtitle = QLabel("添加一个或多个文件夹，启动后同一网络内的设备可以通过下方地址访问。")
         subtitle.setObjectName("subtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -411,10 +515,14 @@ class MainWindow(QMainWindow):
         settings_layout.setHorizontalSpacing(10)
         settings_layout.setVerticalSpacing(12)
 
-        self.folder_input = QLineEdit(str(load_last_folder()))
-        self.folder_input.setReadOnly(True)
-        choose_button = QPushButton("选择文件夹")
-        choose_button.clicked.connect(self.choose_folder)
+        self.folder_list = QListWidget()
+        self.folder_list.addItems([str(folder) for folder in load_shared_folders()])
+        self.folder_list.setMinimumHeight(96)
+
+        self.add_folder_button = QPushButton("添加文件夹")
+        self.add_folder_button.clicked.connect(self.add_folder)
+        self.remove_folder_button = QPushButton("移除选中")
+        self.remove_folder_button.clicked.connect(self.remove_selected_folders)
 
         self.port_input = QSpinBox()
         self.port_input.setRange(1024, 65535)
@@ -428,14 +536,19 @@ class MainWindow(QMainWindow):
         self.speed_unit_input = QComboBox()
         self.speed_unit_input.addItems(["KB/s", "MB/s"])
 
-        settings_layout.addWidget(QLabel("开放文件夹"), 0, 0)
-        settings_layout.addWidget(self.folder_input, 0, 1)
-        settings_layout.addWidget(choose_button, 0, 2)
-        settings_layout.addWidget(QLabel("端口"), 1, 0)
-        settings_layout.addWidget(self.port_input, 1, 1)
-        settings_layout.addWidget(QLabel("下载限速"), 2, 0)
-        settings_layout.addWidget(self.speed_input, 2, 1)
-        settings_layout.addWidget(self.speed_unit_input, 2, 2)
+        folder_buttons = QHBoxLayout()
+        folder_buttons.addWidget(self.add_folder_button)
+        folder_buttons.addWidget(self.remove_folder_button)
+        folder_buttons.addStretch()
+
+        settings_layout.addWidget(QLabel("共享文件夹"), 0, 0)
+        settings_layout.addWidget(self.folder_list, 0, 1, 1, 2)
+        settings_layout.addLayout(folder_buttons, 1, 1, 1, 2)
+        settings_layout.addWidget(QLabel("端口"), 2, 0)
+        settings_layout.addWidget(self.port_input, 2, 1)
+        settings_layout.addWidget(QLabel("下载限速"), 3, 0)
+        settings_layout.addWidget(self.speed_input, 3, 1)
+        settings_layout.addWidget(self.speed_unit_input, 3, 2)
 
         layout.addWidget(settings)
 
@@ -477,7 +590,7 @@ class MainWindow(QMainWindow):
             #subtitle { color: #58606f; }
             QGroupBox { border: 1px solid #d8dde6; border-radius: 6px; margin-top: 10px; padding: 14px 10px 10px 10px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
-            QLineEdit, QSpinBox, QComboBox, QTextEdit { border: 1px solid #cbd3df; border-radius: 5px; padding: 7px; background: #ffffff; }
+            QSpinBox, QComboBox, QListWidget, QTextEdit { border: 1px solid #cbd3df; border-radius: 5px; padding: 7px; background: #ffffff; }
             QPushButton { border: 1px solid #b8c0cc; border-radius: 5px; padding: 8px 16px; background: #f8fafc; }
             QPushButton:hover { background: #eef3f8; }
             QPushButton:disabled { color: #99a1ad; background: #f2f4f7; }
@@ -506,23 +619,40 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
 
-    def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择开放的文件夹", self.folder_input.text())
+    def shared_folders(self):
+        return [self.folder_list.item(index).text() for index in range(self.folder_list.count())]
+
+    def add_folder(self):
+        start_folder = self.shared_folders()[-1] if self.folder_list.count() else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "添加共享文件夹", start_folder)
         if folder:
-            self.folder_input.setText(folder)
-            save_last_folder(folder)
+            folder_path = str(Path(folder).resolve())
+            existing = {os.path.normcase(path) for path in self.shared_folders()}
+            if os.path.normcase(folder_path) not in existing:
+                self.folder_list.addItem(folder_path)
+                save_shared_folders(self.shared_folders())
+
+    def remove_selected_folders(self):
+        for item in self.folder_list.selectedItems():
+            self.folder_list.takeItem(self.folder_list.row(item))
+        save_shared_folders(self.shared_folders())
 
     def start_server(self):
-        folder = self.folder_input.text().strip()
+        folders = self.shared_folders()
         port = self.port_input.value()
         speed_limit_kb = self.speed_limit_kb()
 
-        if not os.path.isdir(folder):
-            QMessageBox.warning(self, "无法启动", "请选择一个有效的文件夹。")
+        if not folders:
+            QMessageBox.warning(self, "无法启动", "请至少添加一个共享文件夹。")
+            return
+
+        invalid_folders = [folder for folder in folders if not os.path.isdir(folder)]
+        if invalid_folders:
+            QMessageBox.warning(self, "无法启动", "以下共享文件夹无效：\n" + "\n".join(invalid_folders))
             return
 
         try:
-            self.server.start(folder, port, speed_limit_kb)
+            self.server.start(folders, port, speed_limit_kb)
         except OSError as exc:
             QMessageBox.critical(self, "启动失败", f"端口 {port} 无法使用：{exc}")
             return
@@ -533,7 +663,9 @@ class MainWindow(QMainWindow):
         self.status_label.style().polish(self.status_label)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.folder_input.setEnabled(False)
+        self.folder_list.setEnabled(False)
+        self.add_folder_button.setEnabled(False)
+        self.remove_folder_button.setEnabled(False)
         self.port_input.setEnabled(False)
         self.speed_input.setEnabled(False)
         self.speed_unit_input.setEnabled(False)
@@ -550,7 +682,9 @@ class MainWindow(QMainWindow):
         self.status_label.style().polish(self.status_label)
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.folder_input.setEnabled(True)
+        self.folder_list.setEnabled(True)
+        self.add_folder_button.setEnabled(True)
+        self.remove_folder_button.setEnabled(True)
         self.port_input.setEnabled(True)
         self.speed_input.setEnabled(True)
         self.speed_unit_input.setEnabled(True)
